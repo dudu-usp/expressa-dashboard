@@ -45,6 +45,7 @@
   .cartao { background: var(--card); border: 1px solid var(--borda); border-radius: var(--raio); box-shadow: var(--sombra); padding: 18px; min-width: 0; }
   .coluna { display: grid; gap: 16px; align-content: start; min-width: 0; }
 
+  .acoes-topo { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .estado { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 700; color: var(--texto-2);
             padding: 6px 12px; border-radius: 99px; border: 1px solid var(--borda); background: var(--card); }
   .ponto { width: 10px; height: 10px; border-radius: 50%; background: var(--apagado); }
@@ -112,7 +113,10 @@
 
   <header>
     <h1><span>✦</span> Expressa · Cuidador</h1>
-    <div id="estado" class="estado"><span class="ponto"></span><span id="estado-texto">conectando ao broker…</span></div>
+    <div class="acoes-topo">
+      <button id="ativar-som" class="btn" hidden>🔔 Ativar som</button>
+      <div id="estado" class="estado"><span class="ponto"></span><span id="estado-texto">conectando ao broker…</span></div>
+    </div>
   </header>
 
   <div class="coluna">
@@ -154,7 +158,8 @@
           <label>Broker (WebSocket)<input id="cfg-broker" type="text"/></label>
           <label>Prefixo dos tópicos<input id="cfg-prefixo" type="text"/></label>
           <div class="linha"><input id="cfg-som" type="checkbox"/><label for="cfg-som">Som quando chegar mensagem urgente</label></div>
-          <div><button id="cfg-salvar" class="btn">Salvar e reconectar</button></div>
+          <div class="linha"><button id="cfg-salvar" class="btn">Salvar e reconectar</button>
+            <button id="cfg-testar-som" class="btn">Testar som</button></div>
         </div>
       </details>
     </section>
@@ -229,17 +234,55 @@ function trataMensagem(topico, texto, retida) {
   render();
 }
 
-// ── Alerta sonoro (sem arquivo de áudio) ─────────────────────────────────
-let audio = null;
-function apita() {
+// ── Alerta sonoro ────────────────────────────────────────────────────────
+// Celulares só deixam tocar um <audio> que já tocou uma vez a partir de um
+// toque na página: o primeiro toque toca um silêncio curto (libera o
+// elemento) e o alerta reaproveita o mesmo elemento. Um <audio> também toca
+// com o iPhone no silencioso, ao contrário do Web Audio. Os sons são WAV
+// gerados aqui, sem arquivo.
+function wav(segundos, amostra) {
+  const taxa = 16000, n = Math.round(taxa * segundos);
+  const d = new DataView(new ArrayBuffer(44 + 2 * n));
+  const txt = (o, s) => { for (let i = 0; i < s.length; i++) d.setUint8(o + i, s.charCodeAt(i)); };
+  txt(0, 'RIFF'); d.setUint32(4, 36 + 2 * n, true); txt(8, 'WAVE');
+  txt(12, 'fmt '); d.setUint32(16, 16, true); d.setUint16(20, 1, true); d.setUint16(22, 1, true);
+  d.setUint32(24, taxa, true); d.setUint32(28, 2 * taxa, true); d.setUint16(32, 2, true); d.setUint16(34, 16, true);
+  txt(36, 'data'); d.setUint32(40, 2 * n, true);
+  for (let i = 0; i < n; i++) d.setInt16(44 + 2 * i, Math.round(32767 * amostra(i / taxa)), true);
+  const bytes = new Uint8Array(d.buffer);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 4096) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 4096));
+  return 'data:audio/wav;base64,' + btoa(bin);
+}
+const SILENCIO = wav(0.05, () => 0);
+const BIPES = wav(0.65, (t) => {           // 3 bipes de 880 Hz, 0,15 s cada, 0,1 s entre eles
+  const k = t % 0.25;
+  if (k >= 0.15) return 0;
+  const envelope = Math.min(1, k / 0.005, (0.15 - k) / 0.005);   // sem estalo no começo e no fim
+  return 0.6 * envelope * Math.sin(2 * Math.PI * 880 * t);
+});
+const somAlerta = new Audio();
+let somLiberado = false;
+
+function mostraBotaoSom() { $('ativar-som').hidden = somLiberado || !cfg.som; }
+
+function liberaSom() {
+  if (somLiberado) return;
   try {
-    audio = audio || new (window.AudioContext || window.webkitAudioContext)();
-    [0, 0.25, 0.5].forEach((t) => {
-      const o = audio.createOscillator(), g = audio.createGain();
-      o.frequency.value = 880; g.gain.value = 0.15;
-      o.connect(g); g.connect(audio.destination);
-      o.start(audio.currentTime + t); o.stop(audio.currentTime + t + 0.15);
-    });
+    somAlerta.src = SILENCIO;
+    const p = somAlerta.play();
+    const ok = () => { somLiberado = true; mostraBotaoSom(); };
+    if (p && p.then) p.then(ok).catch(() => {}); else ok();
+  } catch (e) { /* navegador sem áudio */ }
+}
+['pointerdown', 'touchend', 'keydown'].forEach((ev) => document.addEventListener(ev, liberaSom, { passive: true }));
+
+function apita() {
+  try { if (navigator.vibrate) navigator.vibrate([200, 100, 200, 100, 200]); } catch (e) { /* sem vibração */ }
+  try {
+    somAlerta.src = BIPES;
+    const p = somAlerta.play();
+    if (p && p.catch) p.catch(() => { somLiberado = false; mostraBotaoSom(); });
   } catch (e) { /* navegador sem áudio */ }
 }
 
@@ -367,8 +410,12 @@ $('cfg-salvar').addEventListener('click', () => {
   cfg.prefixo = $('cfg-prefixo').value.trim().replace(/\/+$/, '') || PADRAO.prefixo;
   cfg.som = $('cfg-som').checked;
   gravarLocal('expressa-config', { broker: cfg.broker, prefixo: cfg.prefixo, som: cfg.som });
+  mostraBotaoSom();
   conecta();
 });
+$('cfg-testar-som').addEventListener('click', apita);
+$('ativar-som').addEventListener('click', liberaSom);
+mostraBotaoSom();
 $('limpar').addEventListener('click', () => {
   if (!confirm('Apagar o histórico guardado neste navegador?')) return;
   estado.historico = []; gravarLocal('expressa-historico', []); render();
